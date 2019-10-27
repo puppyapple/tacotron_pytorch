@@ -24,8 +24,8 @@ class Prenet(nn.Module):
             inputs = self.dropout(self.relu(linear(inputs)))
         return inputs
 
-
 class BatchNormConv1d(nn.Module):
+    # 将convolution、batchnorm和activation三者进行合并，方便使用
     def __init__(self, in_dim, out_dim, kernel_size, stride, padding,
                  activation=None):
         super(BatchNormConv1d, self).__init__()
@@ -45,6 +45,7 @@ class BatchNormConv1d(nn.Module):
 class Highway(nn.Module):
     def __init__(self, in_size, out_size):
         super(Highway, self).__init__()
+        # 这里有个疑问，不知道为什么需要把H和T的bias向量分别置0和-1
         self.H = nn.Linear(in_size, out_size)
         self.H.bias.data.zero_()
         self.T = nn.Linear(in_size, out_size)
@@ -69,33 +70,44 @@ class CBHG(nn.Module):
         super(CBHG, self).__init__()
         self.in_dim = in_dim
         self.relu = nn.ReLU()
+        # 一组1d卷积层，K=16时，共有kernel_size=1~16的16个卷积核，可以视为n-gram
+        # 值得注意的是padding后再进行卷积，得到的结果并不是总与原维度一致，视kernel_size的奇偶，有+1的差距
         self.conv1d_banks = nn.ModuleList(
             [BatchNormConv1d(in_dim, in_dim, kernel_size=k, stride=1,
                              padding=k // 2, activation=self.relu)
              for k in range(1, K + 1)])
         self.max_pool1d = nn.MaxPool1d(kernel_size=2, stride=1, padding=1)
 
+        # 卷积投影
+        # projections列表里记录的是被投影之后的output维度，因此作为in_size进入的只有前n-1项
         in_sizes = [K * in_dim] + projections[:-1]
+        # 最后一层投影输出不经过激活函数（按照论文设置）
         activations = [self.relu] * (len(projections) - 1) + [None]
+        # projection1: in_channel=K*in_dim, out_channel=projections[0]
+        # projection2: in_chanel = projection[0], out_channel=projections[1]
+        # ...
+        # projectionN: in_chanel = projection[N-2], out_channel=projections[N-1]
         self.conv1d_projections = nn.ModuleList(
             [BatchNormConv1d(in_size, out_size, kernel_size=3, stride=1,
                              padding=1, activation=ac)
              for (in_size, out_size, ac) in zip(
                  in_sizes, projections, activations)])
-
+        # 为了将进入highway的输入保持和原始input一样的维度，这里先做一次线性变化
         self.pre_highway = nn.Linear(projections[-1], in_dim, bias=False)
+        # 4层highway layer
         self.highways = nn.ModuleList(
             [Highway(in_dim, in_dim) for _ in range(4)])
-
+        # 双向GRU layer
         self.gru = nn.GRU(
             in_dim, in_dim, 1, batch_first=True, bidirectional=True)
 
     def forward(self, inputs, input_lengths=None):
-        # (B, T_in, in_dim)
+        # (B: Batch_size, T_in: input_timestep(aka max_sequence_length), in_dim: input_embedding_size)
         x = inputs
 
         # Needed to perform conv1d on time-axis
-        # (B, in_dim, T_in)
+        # 在时间维度上进行卷积（文本序列）
+        # (B, in_dim, T_in)，保证维度顺序
         if x.size(-1) == self.in_dim:
             x = x.transpose(1, 2)
 
@@ -103,17 +115,22 @@ class CBHG(nn.Module):
 
         # (B, in_dim*K, T_in)
         # Concat conv1d bank outputs
+        # 如上方提到的，卷积后的维度可能为T或T+1，因此需要统一截断
         x = torch.cat([conv1d(x)[:, :, :T] for conv1d in self.conv1d_banks], dim=1)
         assert x.size(1) == self.in_dim * len(self.conv1d_banks)
         x = self.max_pool1d(x)[:, :, :T]
 
+        # before projections: (B, in_dim*K, T_in)
+        # after projections: (B, projections[-1]=128, T_in)
         for conv1d in self.conv1d_projections:
             x = conv1d(x)
 
+
         # (B, T_in, in_dim)
         # Back to the original shape
+        # 先将n-gram拼接的维度和序列维度交换: (B, projections[-1], T_in)=>(B, T_in, projections[-1])
         x = x.transpose(1, 2)
-
+        # 如果channel维度和初始不一样（projections[-1] != in_dim），则做一次变换
         if x.size(-1) != self.in_dim:
             x = self.pre_highway(x)
 
@@ -122,6 +139,8 @@ class CBHG(nn.Module):
         for highway in self.highways:
             x = highway(x)
 
+        # 输入到rnn之前先压紧序列（去掉padding）
+        # 这里pack_padded_sequence的返回值PackedSequence可以直接赋予rnn
         if input_lengths is not None:
             x = nn.utils.rnn.pack_padded_sequence(
                 x, input_lengths, batch_first=True)
@@ -129,6 +148,7 @@ class CBHG(nn.Module):
         # (B, T_in, in_dim*2)
         outputs, _ = self.gru(x)
 
+        # 经过rnn后再将长度统一（重新padding）
         if input_lengths is not None:
             outputs, _ = nn.utils.rnn.pad_packed_sequence(
                 outputs, batch_first=True)
